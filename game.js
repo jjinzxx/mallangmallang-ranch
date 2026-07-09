@@ -1988,6 +1988,10 @@ function setAuthUnavailable(msg){
   if(localStorage.getItem("mmr_guest") !== "1") showAuthOverlay();
 }
 
+function authRedirectUrl(){
+  return `${location.origin}${location.pathname}`;
+}
+
 function renderHeaderAccount(){
   const el = $("#rUser");
   if(me){ el.textContent = "👤 " + (myNickname || "목장주"); el.title = "클릭해서 로그아웃"; }
@@ -1997,12 +2001,14 @@ $("#rUser").onclick = ()=>{
   if(!me){ showAuthOverlay(); return; }
   showModal(`<h2>로그아웃할까요?</h2>
     <p class="hint">진행 상황은 클라우드에 저장되어 있어요.<br>다시 로그인하면 이어서 할 수 있어요.</p>
-    <div style="margin-top:12px;display:flex;gap:8px;justify-content:center;">
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
       <button class="px" id="mBackup">저장 백업</button>
+      <button class="px" id="mResetAccount" style="background:#cfc4ab;">데이터 초기화</button>
       <button class="px" id="mLogout">로그아웃</button>
       <button class="px pink" onclick="closeModal()">취소</button>
     </div>`);
   $("#mBackup").onclick = openBackupModal;
+  $("#mResetAccount").onclick = openResetAccountModal;
   $("#mLogout").onclick = async ()=>{
     await pushCloudNow();
     await sb.auth.signOut();
@@ -2010,6 +2016,48 @@ $("#rUser").onclick = ()=>{
     location.reload();
   };
 };
+
+function openResetAccountModal(){
+  showModal(`<h2>계정 데이터 초기화</h2>
+    <p class="hint">로그인 계정과 목장주 이름은 유지하고, 말·코인·건물·의뢰·업적·클라우드 저장을 새 목장 상태로 되돌려요.<br>되돌릴 수 없으니 필요하면 먼저 저장 백업을 해주세요.</p>
+    <div id="resetMsg" style="font-size:12px;color:#b06a6a;min-height:14px;margin-top:8px;"></div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+      <button class="px" id="mResetYes">초기화</button>
+      <button class="px pink" onclick="closeModal()">취소</button>
+    </div>`);
+  $("#mResetYes").onclick = resetAccountData;
+}
+
+async function resetAccountData(){
+  if(!me || !sb){ toast("로그인 후 사용할 수 있어요"); return; }
+  const msg = $("#resetMsg");
+  const btn = $("#mResetYes");
+  if(btn) btn.disabled = true;
+  if(msg) msg.textContent = "초기화 중…";
+  const nick = myNickname || "목장주";
+  defaultState();
+  normalizeState();
+  localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+  clearTimeout(cloudTimer); cloudTimer = null;
+  const ts = new Date().toISOString();
+  try {
+    const { error: e1 } = await sb.from("mmr_saves")
+      .upsert({ user_id: me.id, data: state, updated_at: ts });
+    warnSetup(e1);
+    const { error: e2 } = await sb.from("mmr_profiles")
+      .upsert({ id: me.id, nickname: nick, trophies: state.trophies, best_horse: bestHorseSnapshot(), updated_at: ts });
+    warnSetup(e2);
+    if(e1 || e2) throw e1 || e2;
+    closeModal();
+    renderHeaderAccount();
+    renderView();
+    toast("계정 데이터를 새 목장으로 초기화했어요");
+  } catch(e){
+    console.warn("Account reset failed", e);
+    if(msg) msg.textContent = "이 기기 저장은 초기화됐지만 클라우드 저장에 실패했어요. 잠시 후 다시 시도해주세요.";
+    if(btn) btn.disabled = false;
+  }
+}
 
 function askNickname(){
   return new Promise(resolve=>{
@@ -2034,28 +2082,52 @@ function askNickname(){
   });
 }
 
+function cloneSaveData(src){
+  return JSON.parse(JSON.stringify(src));
+}
+
+function applySaveData(nextState){
+  state = nextState;
+  normalizeState();
+  localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+}
+
+function askGuestSaveChoice(hasCloudSave){
+  return new Promise(resolve=>{
+    showModal(`<h2>게스트 목장을 어떻게 할까요?</h2>
+      <p class="hint">지금까지 게스트로 키운 목장을 이 계정에 저장하거나, 새 목장으로 시작할 수 있어요.</p>
+      <div style="margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+        <button class="px pink" id="guestKeep">게스트 목장 이어가기</button>
+        ${hasCloudSave ? `<button class="px" id="guestCloud">기존 클라우드 불러오기</button>` : ""}
+        <button class="px" id="guestNew" style="background:#cfc4ab;">새 목장 시작</button>
+      </div>`);
+    $("#guestKeep").onclick = ()=>{ closeModal(); resolve("guest"); };
+    const cloudBtn = $("#guestCloud");
+    if(cloudBtn) cloudBtn.onclick = ()=>{ closeModal(); resolve("cloud"); };
+    $("#guestNew").onclick = ()=>{ closeModal(); resolve("new"); };
+  });
+}
+
 async function onLogin(user){
+  const wasGuest = localStorage.getItem("mmr_guest") === "1";
+  const guestState = wasGuest ? cloneSaveData(state) : null;
   me = user;
   hideAuthOverlay();
-  localStorage.removeItem("mmr_guest");
   let pe = null;
+  let se = null;
+  let cloudState = null;
   try {
     const { data: prof, error } = await sb.from("mmr_profiles")
       .select("nickname").eq("id", me.id).maybeSingle();
     pe = error;
     warnSetup(pe);
     if(prof) myNickname = prof.nickname;
-    // 클라우드 세이브 불러오기 (있으면 클라우드가 우선)
-    const { data: sv, error: se } = await sb.from("mmr_saves")
+    const { data: sv, error: saveError } = await sb.from("mmr_saves")
       .select("data").eq("user_id", me.id).maybeSingle();
+    se = saveError;
     warnSetup(se);
     if(sv && sv.data && sv.data.horses){
-      state = sv.data;
-      normalizeState();
-      localStorage.setItem(SAVE_KEY, JSON.stringify(state));
-      toast("☁️ 클라우드 저장을 불러왔어요!");
-    } else if(!se){
-      await pushCloudNow();
+      cloudState = sv.data;
     }
   } catch(e){
     console.warn("Cloud load failed", e);
@@ -2063,6 +2135,29 @@ async function onLogin(user){
     pe = e;
   }
   if(!myNickname && !pe) await askNickname();
+  if(wasGuest){
+    const choice = await askGuestSaveChoice(!!cloudState);
+    if(choice === "guest" && guestState){
+      applySaveData(guestState);
+      await pushCloudNow();
+      toast("게스트 목장을 계정에 저장했어요!");
+    } else if(choice === "new"){
+      defaultState();
+      normalizeState();
+      localStorage.setItem(SAVE_KEY, JSON.stringify(state));
+      await pushCloudNow();
+      toast("새 목장으로 시작했어요!");
+    } else if(choice === "cloud" && cloudState){
+      applySaveData(cloudState);
+      toast("☁️ 클라우드 저장을 불러왔어요!");
+    }
+  } else if(cloudState){
+    applySaveData(cloudState);
+    toast("☁️ 클라우드 저장을 불러왔어요!");
+  } else if(!se){
+    await pushCloudNow();
+  }
+  localStorage.removeItem("mmr_guest");
   renderHeaderAccount();
   renderView();
   initChat();
@@ -2116,14 +2211,18 @@ async function initAuth(){
     setAuthBusy(true);
     $("#authMsg").textContent = "가입 중…";
     try {
-      const { data, error } = await sb.auth.signUp({ email, password: pw });
+      const { data, error } = await sb.auth.signUp({
+        email,
+        password: pw,
+        options: { emailRedirectTo: authRedirectUrl() },
+      });
       if(error){
         console.warn("Supabase signup error", { code:error.code, status:error.status, message:error.message });
         $("#authMsg").textContent = authErrKo(error);
         return;
       }
       if(data.session){ await onLogin(data.user); return; }
-      $("#authMsg").textContent = "📧 확인 메일을 보냈어요! 메일의 링크를 누른 뒤 로그인해주세요";
+      $("#authMsg").textContent = "📧 확인 메일을 보냈어요! 링크를 누른 뒤 이 화면으로 돌아와 로그인해주세요";
     } catch(e){
       console.warn("Supabase signup exception", e);
       $("#authMsg").textContent = "가입 중 연결 문제가 생겼어요. 잠시 후 다시 시도하거나 게스트로 플레이해주세요.";
